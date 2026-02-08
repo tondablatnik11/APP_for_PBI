@@ -1,40 +1,48 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import time
+import io
 
-# Nastavení stránky
-st.set_page_config(page_title="Logistics Master Data PRO", layout="wide", page_icon="🏭")
+# --- NASTAVENÍ APLIKACE ---
+st.set_page_config(page_title="Logistics Master Data Integrator", layout="wide", page_icon="🏭")
 
-# --- CSS STYLING (Aby to vypadalo profesionálně) ---
+# CSS pro profesionální vzhled
 st.markdown("""
     <style>
-    .stProgress > div > div > div > div {
-        background-color: #00CC00;
-    }
-    .big-font {
-        font-size:20px !important;
-        font-weight: bold;
-    }
+    .stProgress > div > div > div > div { background-color: #00CC00; }
+    .big-font { font-size:20px !important; font-weight: bold; }
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🏭 Generátor Master Dat: Detail Zakázky (PRO Verze)")
-st.markdown("Generuje kompletní dataset pro Power BI s ukazatelem průběhu.")
+st.title("🏭 Logistics Master Data Integrator")
+st.markdown("**Vstup:** 3 soubory (Shipping, Picking, Packing) | **Výstup:** Kompletní dataset pro Power BI")
 
-# --- 1. FUNKCE: ČIŠTĚNÍ ID (KLÍČOVÁ OPRAVA) ---
+# --- POMOCNÉ FUNKCE ---
+
 def clean_id(series):
-    """
-    Vyčistí ID zakázky: Převede na text, smaže mezery, odstraní nuly na začátku.
-    Příklad: '00123 ' -> '123'
-    """
+    """Vyčistí ID zakázky (odstraní nuly na začátku, mezery)."""
     return series.astype(str).str.strip().str.lstrip('0')
 
-# --- 2. FUNKCE: VÝPOČET ČISTÉHO ČASU (PAUZY) ---
+def find_column(df, candidates):
+    """Najde existující sloupec z listu kandidátů."""
+    for col in candidates:
+        if col in df.columns: return col
+        for df_col in df.columns:
+            if df_col.lower() == col.lower(): return df_col
+    return None
+
 def calculate_clean_pick_duration(df_pick):
+    """
+    Pokročilý výpočet čistého času pickování s odečtením pauz.
+    """
+    if 'PickTimestamp' not in df_pick.columns or 'User' not in df_pick.columns:
+        return df_pick
+
     # Seřadit: User -> Čas
     df_pick = df_pick.sort_values(by=['User', 'PickTimestamp'])
     df_pick['Prev_Time'] = df_pick.groupby('User')['PickTimestamp'].shift(1)
+    
+    # Rozdíl v minutách
     df_pick['Diff_Min'] = (df_pick['PickTimestamp'] - df_pick['Prev_Time']).dt.total_seconds() / 60
     
     # Definice pauz
@@ -45,10 +53,14 @@ def calculate_clean_pick_duration(df_pick):
     
     def ocistit(row):
         if pd.isna(row['Prev_Time']): return 0
+        # Pokud je to jiný den, nepočítat
         if row['PickTimestamp'].date() != row['Prev_Time'].date(): return 0
+        
         val = row['Diff_Min']
+        # Pokud je mezera větší než 4 hodiny, je to chyba nebo nová směna
         if val > 240: return 0 
         
+        # Kontrola pauz (zjednodušená - pokud čas spadá do pauzy)
         t = row['PickTimestamp'].time()
         for start, end in pauzy:
             s = pd.to_datetime(start).time()
@@ -60,206 +72,192 @@ def calculate_clean_pick_duration(df_pick):
     df_pick['Cista_Prodleva'] = df_pick.apply(ocistit, axis=1)
     return df_pick
 
-# --- HLAVNÍ LOGIKA ---
-def process_files(file_ship, file_pick, file_pack):
-    
-    # Progress Bar Inicializace
+# --- HLAVNÍ LOGIKA ZPRACOVÁNÍ ---
+
+def process_three_files(file_ship, file_pick, file_pack):
     my_bar = st.progress(0)
     status_text = st.empty()
-    
-    # KROK 1: NAČÍTÁNÍ (0-20%)
-    status_text.text("📂 Krok 1/5: Načítám soubory...")
+
     try:
-        # Shipping
-        if file_ship.name.endswith('.csv'):
-            df_ship = pd.read_csv(file_ship, dtype=str) # Načítáme vše jako text pro jistotu
-        else:
-            df_ship = pd.read_excel(file_ship, dtype=str)
+        # --- 1. NAČTENÍ SOUBORŮ ---
+        status_text.text("📂 Krok 1/4: Načítám data...")
+        
+        # Helper pro načtení
+        def load_file(f):
+            if f.name.endswith('.csv'): return pd.read_csv(f, dtype=str)
+            return pd.read_excel(f, dtype=str)
+
+        df_ship = load_file(file_ship)
+        df_pick = load_file(file_pick)
+        df_pack = load_file(file_pack)
+        
+        my_bar.progress(25)
+
+        # --- 2. ČIŠTĚNÍ ID (PRO SPOJENÍ) ---
+        status_text.text("🧹 Krok 2/4: Čistím ID zakázek a páruji...")
+        
+        col_ship_id = find_column(df_ship, ['Delivery', 'Zakázka', 'Shipment'])
+        col_pick_id = find_column(df_pick, ['Delivery', 'Zakázka'])
+        col_pack_id = find_column(df_pack, ['Generated delivery', 'Delivery'])
+
+        if not all([col_ship_id, col_pick_id, col_pack_id]):
+            st.error(f"Chybí klíčové sloupce ID! (Našel: Ship={col_ship_id}, Pick={col_pick_id}, Pack={col_pack_id})")
+            return None
+
+        df_ship['KEY'] = clean_id(df_ship[col_ship_id])
+        df_pick['KEY'] = clean_id(df_pick[col_pick_id])
+        df_pack['KEY'] = clean_id(df_pack[col_pack_id])
+
+        my_bar.progress(50)
+
+        # --- 3. AGREGACE A VÝPOČTY (PICKING & PACKING) ---
+        status_text.text("⚙️ Krok 3/4: Počítám metriky (Kusy, Materiály, Časy)...")
+
+        # >>> ZPRACOVÁNÍ PICKINGU <<<
+        # Převod sloupců na čísla/data
+        col_pick_qty = find_column(df_pick, ['Source target qty', 'Množství', 'Qty', 'Pieces'])
+        col_pick_mat = find_column(df_pick, ['Material', 'Materiál'])
+        
+        # Vytvoření Timestampu pro pickování
+        if 'Confirmation date' in df_pick.columns and 'Confirmation time' in df_pick.columns:
+            df_pick['PickTimestamp'] = pd.to_datetime(
+                df_pick['Confirmation date'].astype(str) + ' ' + df_pick['Confirmation time'].astype(str),
+                errors='coerce'
+            )
+            # Aplikace logiky čistého času
+            if 'Source target qty' in df_pick.columns: # jen pokud máme sloupec qty
+                df_pick[col_pick_qty] = pd.to_numeric(df_pick[col_pick_qty], errors='coerce').fillna(0)
             
-        # Picking
-        if file_pick.name.endswith('.csv'):
-            df_pick = pd.read_csv(file_pick) # Tady potřebujeme typy pro výpočty, ale ID opravíme
-        else:
-            df_pick = pd.read_excel(file_pick)
-            
-        # Packing
-        if file_pack.name.endswith('.csv'):
-            df_pack = pd.read_csv(file_pack)
-        else:
-            df_pack = pd.read_excel(file_pack)
-            
-    except Exception as e:
-        st.error(f"Chyba při načítání souborů: {e}")
-        return None
+            # Pokud máme User sloupec, spočítáme čistý čas
+            if 'User' in df_pick.columns:
+                df_pick = calculate_clean_pick_duration(df_pick)
 
-    my_bar.progress(20)
-    time.sleep(0.5)
-
-    # KROK 2: ČIŠTĚNÍ KLÍČŮ (20-40%)
-    status_text.text("🧹 Krok 2/5: Čistím ID zakázek pro správné párování...")
-    
-    # Aplikujeme čištění ID na všechny tabulky
-    if 'Delivery' in df_ship.columns:
-        df_ship['Delivery_Key'] = clean_id(df_ship['Delivery'])
-    else:
-        st.error("Chybí sloupec 'Delivery' v Shipping souboru!")
-        return None
-
-    if 'Delivery' in df_pick.columns:
-        df_pick['Delivery_Key'] = clean_id(df_pick['Delivery'])
-    else:
-        st.error("Chybí sloupec 'Delivery' v Picking souboru!")
-        return None
-
-    if 'Generated delivery' in df_pack.columns:
-        df_pack['Delivery_Key'] = clean_id(df_pack['Generated delivery'])
-    else:
-        st.error("Chybí sloupec 'Generated delivery' v Packing souboru!")
-        return None
-
-    my_bar.progress(40)
-    
-    # KROK 3: ZPRACOVÁNÍ PICKINGU (40-60%)
-    status_text.text("⏱️ Krok 3/5: Počítám časy pickování a pauzy...")
-    
-    # Timestamp
-    if 'Confirmation date' in df_pick.columns and 'Confirmation time' in df_pick.columns:
-        df_pick['PickTimestamp'] = pd.to_datetime(
-            df_pick['Confirmation date'].astype(str) + ' ' + df_pick['Confirmation time'].astype(str),
-            errors='coerce'
-        )
-    
-    # Výpočty
-    df_pick = calculate_clean_pick_duration(df_pick)
-    
-    # Agregace
-    if 'Source target qty' in df_pick.columns:
-        qty_col = 'Source target qty'
-    else:
-        qty_col = 'Dest.target quantity' 
-
-    pick_agg = df_pick.groupby('Delivery_Key').agg({
-        'PickTimestamp': ['min', 'max'],
-        'Cista_Prodleva': 'sum',
-        'User': 'nunique',
-        'Material': ['nunique', 'count'],
-        qty_col: 'sum',
-        'Source Storage Bin': 'nunique'
-    }).reset_index()
-    
-    pick_agg.columns = [
-        'Delivery_Key', 'Pick_Start', 'Pick_End', 'Labor_Time_Min', 
-        'Unique_Pickers', 'Unique_Materials', 'Total_Pick_Lines', 
-        'Total_Pieces', 'Unique_Bins'
-    ]
-    pick_agg['Process_Pick_Duration_Min'] = (pick_agg['Pick_End'] - pick_agg['Pick_Start']).dt.total_seconds() / 60
-    
-    my_bar.progress(60)
-
-    # KROK 4: ZPRACOVÁNÍ PACKINGU (60-80%)
-    status_text.text("📦 Krok 4/5: Analyzuji obaly a expedici...")
-    
-    df_pack['Label_Created_Time'] = pd.to_datetime(
-        df_pack['Created On'].astype(str) + ' ' + df_pack['Time'].astype(str), errors='coerce'
-    )
-    df_pack['Shipment_Added_Time'] = pd.to_datetime(
-        df_pack['Changed On'].astype(str) + ' ' + df_pack['Time of change'].astype(str), errors='coerce'
-    )
-    
-    def get_mode(x):
-        m = pd.Series.mode(x)
-        return m.values[0] if not m.empty else np.nan
-
-    pack_agg = df_pack.groupby('Delivery_Key').agg({
-        'Label_Created_Time': 'min',
-        'Shipment_Added_Time': 'max',
-        'Handling Unit': 'nunique',
-        'Packaging materials': get_mode
-    }).reset_index()
-    
-    pack_agg.rename(columns={'Packaging materials': 'Main_Packaging_Type'}, inplace=True)
-    
-    my_bar.progress(80)
-
-    # KROK 5: FINÁLNÍ SPOJENÍ (80-100%)
-    status_text.text("🔗 Krok 5/5: Spojuji vše do Master Reportu...")
-    
-    # Master data z Shipping
-    date_cols = ['Creation date delivery', 'Loading Date', 'Pland Gds Mvmnt Date']
-    for c in date_cols:
-        if c in df_ship.columns:
-            df_ship[c] = pd.to_datetime(df_ship[c], errors='coerce')
-
-    # MERGE (Left Join na Delivery_Key)
-    df_final = pd.merge(df_ship, pick_agg, on='Delivery_Key', how='left')
-    df_final = pd.merge(df_final, pack_agg, on='Delivery_Key', how='left')
-
-    # Doplnění KPI
-    df_final['Duration_Reaction_Hrs'] = (df_final['Pick_Start'] - df_final['Creation date delivery']).dt.total_seconds() / 3600
-    df_final['Duration_Wait_Pack_Hrs'] = (df_final['Label_Created_Time'] - df_final['Pick_End']).dt.total_seconds() / 3600
-    df_final['End_Process_Time'] = df_final['Shipment_Added_Time'].fillna(df_final['Loading Date'])
-    df_final['Duration_Pack_Ship_Hrs'] = (df_final['End_Process_Time'] - df_final['Label_Created_Time']).dt.total_seconds() / 3600
-
-    def check_otp(row):
-        if pd.isna(row['Loading Date']) or pd.isna(row['Pland Gds Mvmnt Date']): return "N/A"
-        if row['Loading Date'].date() <= row['Pland Gds Mvmnt Date'].date(): return "Včas"
-        return "ZPOŽDĚNÍ"
-    
-    df_final['OTP_Status'] = df_final.apply(check_otp, axis=1)
-
-    def analyze_delay(row):
-        if row['OTP_Status'] != "ZPOŽDĚNÍ": return "OK"
-        times = {
-            "Reakce Skladu": row['Duration_Reaction_Hrs'] if pd.notna(row['Duration_Reaction_Hrs']) else 0,
-            "Pickování": (row['Process_Pick_Duration_Min']/60) if pd.notna(row['Process_Pick_Duration_Min']) else 0,
-            "Čekání na Balení": row['Duration_Wait_Pack_Hrs'] if pd.notna(row['Duration_Wait_Pack_Hrs']) else 0,
-            "Balení/Expedice": row['Duration_Pack_Ship_Hrs'] if pd.notna(row['Duration_Pack_Ship_Hrs']) else 0
+        # Agregace Pickingu
+        agg_rules_pick = {
+            'PickTimestamp': ['min', 'max'], # Start a Konec pickování
+            col_pick_mat: 'nunique',         # Počet unikátních materiálů
+            col_pick_qty: 'sum',             # Celkem kusů
         }
-        return max(times, key=times.get)
+        if 'Cista_Prodleva' in df_pick.columns:
+            agg_rules_pick['Cista_Prodleva'] = 'sum' # Čistý čas práce (suma minut)
 
-    df_final['Main_Delay_Reason'] = df_final.apply(analyze_delay, axis=1)
-    
-    # Odstraníme pomocný klíč
-    df_final.drop(columns=['Delivery_Key'], inplace=True)
-    
-    my_bar.progress(100)
-    status_text.success("✅ HOTOVO! Data jsou připravena ke stažení.")
-    
-    return df_final
+        df_pick_agg = df_pick.groupby('KEY').agg(agg_rules_pick).reset_index()
+        
+        # Přejmenování sloupců (flatten multi-index)
+        df_pick_agg.columns = ['KEY', 'Pick_Start', 'Pick_End', 'Unique_Materials', 'Total_Pieces'] + \
+                              (['Labor_Time_Min'] if 'Cista_Prodleva' in df_pick.columns else [])
 
-# --- UI LOGIKA ---
+        # >>> ZPRACOVÁNÍ PACKINGU <<<
+        col_pack_mat = find_column(df_pack, ['Packaging materials', 'Packaging', 'Balení'])
+        
+        # Získání hlavního typu balení (nejčastější hodnota)
+        def get_mode(x):
+            return x.mode()[0] if not x.mode().empty else ""
+
+        df_pack_agg = df_pack.groupby('KEY').agg({
+            col_pack_mat: get_mode
+        }).reset_index()
+        df_pack_agg.rename(columns={col_pack_mat: 'Main_Packaging_Type'}, inplace=True)
+
+        my_bar.progress(75)
+
+        # --- 4. FINÁLNÍ SPOJENÍ A KPI ---
+        status_text.text("🔗 Krok 4/4: Kompletuji Master Data...")
+
+        # Left Join: Shipping (Hlavní) <- Picking <- Packing
+        df_final = pd.merge(df_ship, df_pick_agg, on='KEY', how='left')
+        df_final = pd.merge(df_final, df_pack_agg, on='KEY', how='left')
+
+        # Doplnění nul tam, kde nebylo pickování (např. 0 kusů)
+        df_final['Total_Pieces'] = df_final['Total_Pieces'].fillna(0)
+        df_final['Unique_Materials'] = df_final['Unique_Materials'].fillna(0)
+
+        # Konverze dat z Shipping
+        col_loading = find_column(df_final, ['Loading Date', 'Datum nakládky'])
+        col_planned = find_column(df_final, ['Pland Gds Mvmnt Date', 'Plánovaný GI', 'Planned GI'])
+        
+        if col_loading: df_final[col_loading] = pd.to_datetime(df_final[col_loading], errors='coerce')
+        if col_planned: df_final[col_planned] = pd.to_datetime(df_final[col_planned], errors='coerce')
+
+        # Výpočet OTP Statusu
+        def get_otp(row):
+            if pd.isna(row.get(col_loading)) or pd.isna(row.get(col_planned)): return "N/A"
+            return "Včas" if row[col_loading] <= row[col_planned] else "Zpoždění"
+
+        if col_loading and col_planned:
+            df_final['OTP_Status'] = df_final.apply(get_otp, axis=1)
+        else:
+            df_final['OTP_Status'] = "N/A (Chybí data)"
+
+        # Výpočet Delay Reason (zjednodušený)
+        def get_reason(row):
+            if row['OTP_Status'] != "Zpoždění": return "OK"
+            # Zde je prostor pro logiku: pokud Pick_End > Planned -> "Pozdní Pick", atd.
+            if pd.notna(row.get('Pick_End')) and pd.notna(row.get(col_planned)):
+                if row['Pick_End'] > row[col_planned]: return "Zpoždění ve skladu (Pick)"
+            return "Jiné zpoždění"
+            
+        df_final['Main_Delay_Reason'] = df_final.apply(get_reason, axis=1)
+
+        # Úklid
+        df_final.drop(columns=['KEY'], inplace=True)
+        
+        my_bar.progress(100)
+        status_text.success("✅ Hotovo!")
+        
+        return df_final
+
+    except Exception as e:
+        st.error(f"Kritická chyba při zpracování: {e}")
+        return None
+
+# --- UI STRÁNKA ---
+
 st.markdown("### 1. Nahraj vstupní soubory")
 col1, col2, col3 = st.columns(3)
-f_ship = col1.file_uploader("SHIPPING_ALL", type=['csv', 'xlsx'])
-f_pick = col2.file_uploader("PICK_ALL", type=['csv', 'xlsx'])
-f_pack = col3.file_uploader("PACKING_ALL", type=['csv', 'xlsx'])
+f_ship = col1.file_uploader("📂 SHIPPING (Zakázky)", type=['csv', 'xlsx'])
+f_pick = col2.file_uploader("📂 PICKING (Položky/Scany)", type=['csv', 'xlsx'])
+f_pack = col3.file_uploader("📂 PACKING (Balení)", type=['csv', 'xlsx'])
 
 if f_ship and f_pick and f_pack:
-    if st.button("🚀 Spustit Analýzu Zakázek", use_container_width=True):
+    if st.button("🚀 Spustit Integraci a Analýzu", type="primary"):
         
-        df_result = process_files(f_ship, f_pick, f_pack)
+        df_result = process_three_files(f_ship, f_pick, f_pack)
         
         if df_result is not None:
             st.markdown("---")
-            st.subheader("📊 Náhled Výsledku (Prvních 50 řádků)")
+            st.subheader("📊 Náhled výsledku (Prvních 50 řádků)")
             
-            # Zobrazíme klíčové sloupce
-            cols_show = [col for col in ['Delivery', 'OTP_Status', 'Total_Pieces', 'Unique_Materials', 'Main_Packaging_Type', 'Main_Delay_Reason'] if col in df_result.columns]
-            st.dataframe(df_result[cols_show].head(50))
+            # Výběr důležitých sloupců pro náhled (pokud existují)
+            priority_cols = ['Delivery', 'OTP_Status', 'Total_Pieces', 'Unique_Materials', 'Main_Packaging_Type', 'Main_Delay_Reason']
+            available_cols = [c for c in priority_cols if c in df_result.columns]
             
-            st.markdown("### 📥 STÁHNOUT KOMPLETNÍ DATA")
-            st.info("Klikni na tlačítko níže pro stažení celého souboru pro Power BI.")
+            st.dataframe(df_result[available_cols].head(50), use_container_width=True)
             
-            # Export do Excelu
-            import io
+            # --- EXPORT PRO POWER BI ---
+            st.markdown("### 📤 Export pro Power BI")
+            st.write("Tento soubor obsahuje spojená data se všemi detaily.")
+            
+            # CSV Export (nejlepší pro PBI)
+            csv_data = df_result.to_csv(index=False, sep=',', encoding='utf-8')
+            
+            col_d1, col_d2 = st.columns(2)
+            
+            col_d1.download_button(
+                label="Stáhnout CSV pro Power BI",
+                data=csv_data,
+                file_name="MasterData_PowerBI.csv",
+                mime="text/csv"
+            )
+            
+            # Excel Export (alternativa)
             buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                df_result.to_excel(writer, index=False, sheet_name='MasterData')
+            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                df_result.to_excel(writer, index=False, sheet_name='Data')
             
-            st.download_button(
-                label="📥 STÁHNOUT MASTER EXCEL (.xlsx)",
+            col_d2.download_button(
+                label="Stáhnout Excel (.xlsx)",
                 data=buffer,
-                file_name="DETAIL_ZAKAZEK_POWERBI_FINAL.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key='download-excel'
+                file_name="MasterData_PowerBI.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
